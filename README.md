@@ -6,3 +6,7 @@ machine problems.
 
 After cloning this repository, you should replace the contents of this README
 file with, at minimum, your name, email address, and student ID.
+
+Edwin Zamudio
+ezamudio@hawk.iit.edu
+A20416629

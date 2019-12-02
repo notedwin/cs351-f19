@@ -6,7 +6,7 @@
 #include <string.h>
 #include <assert.h>
 #include <unistd.h>
-
+#include <limits.h>
 #include "mm.h"
 #include "memlib.h"
 
@@ -15,32 +15,159 @@
 
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
-
-
+#define BHEADER_SIZE ALIGN(sizeof(bHeader))
+#define STRIPPED_HEADER ALIGN(sizeof(size_t))
+#define BFOOTER_SIZE ALIGN(sizeof(bFooter))
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
+#define BINS 10
 
+typedef struct header bHeader; 
+typedef struct footer bFooter;
+bHeader * find_fit(size_t size);
+
+struct header{
+	size_t size;
+	bHeader * next;
+	bHeader * prev;
+};
+struct footer{
+	bHeader * head;
+};
+
+struct header heads[BINS];
+int cutoff[BINS] = {17,65,113,129,449,1621,4073,4096,8191,INT_MAX};
+
+int getIndex(size_t size){
+int index;
+   for(index = 0; index<BINS; ++index){
+      if(size< cutoff[index])
+         break;
+   }
+   return index;
+}
+
+#ifdef BLOCK_CACHING
+#define NUM_BLOCK_CACHE 10
+#define BLOCK_TRIGGER 10
+typedef struct block_cache mcache;
+struct block_cache{
+   size_t size;
+   size_t count;
+};
+struct block_cache blocks[NUM_BLOCK_CACHE];
+void poke_block(size_t size){
+   int i;
+   int lowest=INT_MAX;
+   int low_index = 0;
+   for(i=0;i<NUM_BLOCK_CACHE;++i){
+      if(blocks[i].count<lowest){
+         lowest=blocks[i].count;
+         low_index=i;
+      }
+      if(blocks[i].size==size){
+         if(blocks[i].count++>BLOCK_TRIGGER){
+            size_t size = ALIGN((blocks[i].size+STRIPPED_HEADER+BFOOTER_SIZE)*blocks[i].count);
+            bHeader * p = mem_sbrk(size);
+            p->size=size;
+            ((bFooter *)((char *)p+((p->size)&~1)-BFOOTER_SIZE))->head = p;
+            bHeader * front = &heads[getIndex(size)];
+            front->next->prev = p;
+            p->next=front->next;
+            p->prev=front;
+            front->next=p;
+            blocks[i].count=0;
+         }
+         return;
+      }
+   }
+   blocks[low_index].size=size;
+   blocks[low_index].count=1;
+}
+#endif
+int freecount;
 /* 
  * mm_init - initialize the malloc package.
  */
+
 int mm_init(void)
 {
+  freecount = 0;
+   bHeader *p = mem_sbrk(BHEADER_SIZE+BFOOTER_SIZE);
+   p->next=p;
+   p->prev=p;
+   p->size=BHEADER_SIZE+BFOOTER_SIZE+1;
+   bFooter *q=(bFooter *)((char *)p+BHEADER_SIZE);
+   q->head=p;
+   int i;
+   for(i = 0; i<BINS;++i){
+      heads[i].next=&heads[i];
+      heads[i].prev=&heads[i];
+      heads[i].size=BHEADER_SIZE+BFOOTER_SIZE+1;
+   }
   return 0;
 }
-
-/* 
- * mm_malloc - Allocate a block by incrementing the brk pointer.
+/* mm_malloc - Allocate a block by incrementing the brk pointer.
  *     Always allocate a block whose size is a multiple of the alignment.
  */
 void *mm_malloc(size_t size)
 {
-  int newsize = ALIGN(size + SIZE_T_SIZE);
-  void *p = mem_sbrk(newsize);
-  if ((long)p == -1)
-    return NULL;
-  else {
-    *(size_t *)p = size;
-    return (void *)((char *)p + SIZE_T_SIZE);
-  }
+   size_t newsize = ALIGN(size + STRIPPED_HEADER+ BFOOTER_SIZE);
+   bHeader *p;
+   if(freecount > 0 && (p=find_fit(newsize))!=NULL){
+      if(((p->size)&~1)-newsize>=7+BHEADER_SIZE+BFOOTER_SIZE){
+         size_t oldsize = p->size;
+         p->size = newsize;
+         ((bFooter *)((char *)p+((p->size)&~1)-BFOOTER_SIZE))->head = p;
+         bHeader *split=(bHeader *)((char *)p + (p->size & ~1));
+         split->size=oldsize-p->size; 
+         ((bFooter *)((char *)split+((split->size)&~1)-BFOOTER_SIZE))->head = split;
+         int index = getIndex(split->size-STRIPPED_HEADER-BFOOTER_SIZE);
+         split->next = heads[index].next;
+         heads[index].next=split;
+         split->next->prev=split;
+         split->prev=&heads[index];
+         ++freecount;
+      }
+      if(freecount>0){
+         --freecount;
+      }
+      p->prev->next=p->next;
+      p->next->prev=p->prev;
+      p->size|= 1;
+   }else{
+      bHeader * last=(((bFooter *)((char *)mem_heap_hi()+1-BFOOTER_SIZE))->head);
+      if((freecount>0)&&(!(last->size &1))){
+         --freecount;
+         mem_sbrk(newsize-last->size);
+         last->size = newsize | 1;
+         ((bFooter *)((char *)last+((last->size)&~1)-BFOOTER_SIZE))->head = last;
+         last->prev->next=last->next;
+         last->next->prev=last->prev;
+         p = last;
+      } else {
+         p = mem_sbrk(newsize);
+         if ((long)p == -1){
+            return NULL;
+         }
+         else {
+            p->size=newsize | 1;
+            bFooter *q=(bFooter *)((char *)p+((p->size)&~1)-BFOOTER_SIZE);
+            q->head=p;
+         }
+      }
+   }
+   return (void *)((char *)p+sizeof(size_t));
+}
+
+bHeader * find_fit(size_t size){
+   int index = getIndex(size);
+   bHeader * p ;
+   for(; index<BINS; ++index){
+      for(p = heads[index].next; (p != &heads[index])&&(p->size<size+STRIPPED_HEADER+BFOOTER_SIZE);p=p->next);
+      if(p != &heads[index])
+         return p;
+   }
+   return NULL;
 }
 
 /*
@@ -48,6 +175,31 @@ void *mm_malloc(size_t size)
  */
 void mm_free(void *ptr)
 {
+   ++freecount;
+   bHeader *p = (bHeader *)((char *)ptr - STRIPPED_HEADER);
+   bHeader *prev = ((bFooter *)((char *)p - BFOOTER_SIZE))->head;
+   p->size &= ~1;
+   if(!((prev->size)&1)){
+      prev->prev->next=prev->next;
+      prev->next->prev=prev->prev;
+      prev->size+=p->size;
+      ((bFooter *)((char *)p+((p->size)&~1)-BFOOTER_SIZE))->head = prev;
+      p = prev;
+      --freecount;
+   }
+   bHeader *next=(bHeader *)((char *)p + (p->size &= ~1));
+   if(((void *)((char *)p+p->size) <= mem_heap_hi()) && !((next->size)&1)){
+      p->size+=next->size;
+      ((bFooter *)((char *)p+((p->size)&~1)-BFOOTER_SIZE))->head = p;
+      next->prev->next=next->next;
+      next->next->prev=next->prev;
+      --freecount;
+   }
+   bHeader * front = &heads[getIndex(p->size-STRIPPED_HEADER-BFOOTER_SIZE)];
+   p->prev=front;
+   p->next=front->next;
+   front->next->prev = p;
+   front->next=p;
 }
 
 /*
@@ -55,17 +207,28 @@ void mm_free(void *ptr)
  */
 void *mm_realloc(void *ptr, size_t size)
 {
-  void *oldptr = ptr;
-  void *newptr;
-  size_t copySize;
-    
-  newptr = mm_malloc(size);
-  if (newptr == NULL)
-    return NULL;
-  copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
-  if (size < copySize)
-    copySize = size;
-  memcpy(newptr, oldptr, copySize);
-  mm_free(oldptr);
-  return newptr;
+size_t newsize = ALIGN(size + STRIPPED_HEADER+ BFOOTER_SIZE);
+   bHeader *p = (bHeader *)((char *)ptr - sizeof(size_t));
+   bHeader *next=(bHeader *)((char *)p + (p->size &= ~1));
+   if((p->size&~1)>newsize){	
+      return ptr;
+   }
+   if(((void *)((char *)p+p->size) <= mem_heap_hi()) && !((next->size)&1) && (next->size + (p->size&~1) > newsize)){
+      p->size=(p->size+next->size)|1;
+      ((bFooter *)((char *)p+((p->size)&~1)-BFOOTER_SIZE))->head = p;
+      next->prev->next=next->next;
+      next->next->prev=next->prev;
+      return ptr;
+   }
+   if(((void *)((char *)p+p->size) >= mem_heap_hi())){
+      mem_sbrk(newsize-p->size);
+      p->size=newsize;
+      ((bFooter *)((char *)p+((p->size)&~1)-BFOOTER_SIZE))->head = p;
+      return ptr;
+   }
+   void * new = mm_malloc(size);
+   memcpy(new,ptr,p->size-STRIPPED_HEADER-BFOOTER_SIZE);
+   mm_free(ptr);
+   return new;
+
 }
